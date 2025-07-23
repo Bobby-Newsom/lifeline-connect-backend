@@ -1,8 +1,9 @@
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
-from typing import Optional, List
+from typing import Optional, List, Tuple
 from pydantic import BaseModel
 import pandas as pd
+import re
 
 from zip_utils import zip_to_city_map, city_to_zips
 
@@ -23,7 +24,6 @@ app.add_middleware(
 # --- Load and normalize data once at startup ---
 df = pd.read_csv("resources.csv", dtype=str).fillna("")
 
-# Normalize column names to match our Pydantic model
 df.rename(
     columns={
         "isVirtual": "isvirtual",
@@ -34,7 +34,6 @@ df.rename(
     inplace=True,
 )
 
-# Make sure all expected columns exist
 required_cols = [
     "category",
     "name",
@@ -53,7 +52,6 @@ for col in required_cols:
         df[col] = ""
 
 
-# --- Pydantic model ---
 class Resource(BaseModel):
     category: str = ""
     name: str
@@ -68,7 +66,6 @@ class Resource(BaseModel):
     areas_served: str = ""
 
 
-# --- Routes ---
 @app.get(
     "/resources/",
     response_model=List[Resource],
@@ -84,7 +81,6 @@ def get_resources(
 ):
     results = df.copy()
 
-    # Filter by city or ZIP
     if city:
         results = results[results["city"].str.lower() == city.lower()]
     elif zip:
@@ -98,11 +94,139 @@ def get_resources(
         else:
             results = results[results["zip"] == zip]
 
-    # Filter virtual / non-virtual
     if is_virtual is not None:
-        # CSV stores TRUE/FALSE (strings). Compare lowercased.
         results = results[
             results["isvirtual"].str.lower() == str(is_virtual).lower()
         ]
 
     return results.to_dict(orient="records")
+
+
+# -----------------------
+# Helpers for /ask route
+# -----------------------
+
+ZIP_REGEX = re.compile(r"\b\d{5}\b")
+
+def extract_location(query: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Return (city, zip) if found in text. City is lowercase.
+    """
+    q = query.lower()
+
+    # Zip first
+    m = ZIP_REGEX.search(q)
+    if m:
+        z = m.group(0)
+        if z in zip_to_city_map:
+            return zip_to_city_map[z], z
+        return None, z
+
+    # City match from our known list
+    for c in city_to_zips.keys():
+        if c in q:
+            return c, None
+
+    return None, None
+
+FOOD_WORDS = ["food", "meal", "pantry", "hunger", "groceries", "eat"]
+HOUSING_WORDS = ["housing", "shelter", "rent", "homeless"]
+UTIL_WORDS = ["utility", "utilities", "electric", "water", "gas", "bill"]
+MENTAL_HEALTH_WORDS = ["mental", "therapy", "counsel", "counseling", "therapist"]
+
+def filter_by_topic(df_in: pd.DataFrame, query: str) -> pd.DataFrame:
+    q = query.lower()
+    if any(w in q for w in FOOD_WORDS):
+        mask = df_in["category"].str.contains("food", case=False) | df_in["description"].str.contains("food|meal|pantry", case=False, na=False)
+        return df_in[mask]
+    if any(w in q for w in HOUSING_WORDS):
+        mask = df_in["category"].str.contains("housing|shelter", case=False) | df_in["description"].str.contains("housing|shelter|rent", case=False, na=False)
+        return df_in[mask]
+    if any(w in q for w in UTIL_WORDS):
+        mask = df_in["category"].str.contains("utilities", case=False) | df_in["description"].str.contains("utility|bill", case=False, na=False)
+        return df_in[mask]
+    if any(w in q for w in MENTAL_HEALTH_WORDS):
+        mask = df_in["category"].str.contains("mental", case=False) | df_in["description"].str.contains("mental|therapy|counsel", case=False, na=False)
+        return df_in[mask]
+
+    # default: no topic filtering
+    return df_in
+
+
+# -------------
+# /ask endpoint
+# -------------
+from fastapi import Body
+
+class AskRequest(BaseModel):
+    query: str
+
+class AskResponse(BaseModel):
+    response: str
+    resources: List[Resource] = []
+
+
+@app.post("/ask", response_model=AskResponse, tags=["Chat"])
+def ask(payload: AskRequest = Body(...)):
+    query = payload.query.strip()
+    if not query:
+        return AskResponse(response="Please enter a question.", resources=[])
+
+    # location detection
+    city, z = extract_location(query)
+
+    filtered = df.copy()
+
+    # Narrow by location if we got one
+    if city:
+        related_zips = city_to_zips.get(city, [])
+        filtered = filtered[
+            (filtered["city"].str.lower() == city)
+            | (filtered["zip"].isin(related_zips))
+        ]
+    elif z:
+        matched_city = zip_to_city_map.get(z)
+        if matched_city:
+            related_zips = city_to_zips.get(matched_city, [])
+            filtered = filtered[
+                filtered["zip"].isin(related_zips)
+                | (filtered["city"].str.lower() == matched_city)
+            ]
+        else:
+            filtered = filtered[filtered["zip"] == z]
+
+    # Topic filter (food, housing, etc.)
+    filtered = filter_by_topic(filtered, query)
+
+    # If still empty, just fallback to original df (or return none)
+    if filtered.empty:
+        filtered = df.copy()
+
+    # Limit to 10 results
+    filtered = filtered.head(10)
+
+    # Build a friendly text
+    if city:
+        loc_text = city.title()
+    elif z:
+        loc_text = z
+    else:
+        loc_text = "your area"
+
+    topic_word = ""
+    ql = query.lower()
+    if any(w in ql for w in FOOD_WORDS):
+        topic_word = "food "
+    elif any(w in ql for w in HOUSING_WORDS):
+        topic_word = "housing "
+    elif any(w in ql for w in UTIL_WORDS):
+        topic_word = "utility "
+    elif any(w in ql for w in MENTAL_HEALTH_WORDS):
+        topic_word = "mental health "
+
+    text_intro = f"Here are some {topic_word}resources near {loc_text}:"
+
+    # Convert to dict list for response_model
+    resources_out = filtered.to_dict(orient="records")
+
+    return AskResponse(response=text_intro, resources=resources_out)
